@@ -1,39 +1,46 @@
 import numpy as np
 
-class DualHorizonEngine:
-    def __init__(self, risk_pct=0.01):
-        self.risk_pct = risk_pct
-        self.mode = "HFT_SCALP"  # Default starting mode
 
-    def evaluate_market_regime(self, vpin: float, spread_z: float, micro_velocity: float) -> str:
-        """
-        Switches execution horizon based on order flow toxicity (VPIN) and structural momentum.
-        """
-        # Clean structural imbalance detected -> Switch to Structural Reversal Mode
-        if abs(spread_z) > 8.0 and vpin < 0.40:
-            self.mode = "STRUCTURAL_REVERSAL"
-        # High toxicity or flat momentum -> Revert to Ultra-Fast HFT Scalp Mode
-        elif vpin > 0.65 or abs(micro_velocity) < 0.1:
-            self.mode = "HFT_SCALP"
-            
-        return self.mode
+class DualHorizonRegimeEngine:
+  """Controls dynamic toggling between HFT scalps and structural reversals with institutional gates."""
 
-    def calculate_optimal_holding_horizon(self, volatility: float, vpin: float, inventory_q: int, gamma: float) -> float:
-        """
-        Computes the stochastic optimal holding horizon based on inventory penalty 
-        and volatility decay rather than an arbitrary clock time.
-        """
-        # Base holding time scaled inversely by volatility and risk aversion (gamma)
-        safe_gamma = max(gamma, 0.01)
-        base_horizon = 60.0 / (volatility * safe_gamma)
-        
-        # Compress the horizon if VPIN toxicity spikes (emergency exit acceleration)
-        toxicity_penalty = max(1.0, vpin * 3.0)
-        
-        # Adjust for inventory weight (heavier inventory exits faster)
-        inventory_factor = 1.0 + (abs(inventory_q) * 0.1)
-        
-        optimal_seconds = (base_horizon / toxicity_penalty) / inventory_factor
-        
-        # Clamp between ultra-fast HFT bounds (10s) and max structural cap (900s)
-        return float(np.clip(optimal_seconds, 10.0, 900.0))
+  def __init__(
+      self,
+      base_gamma: float = 0.1,
+      vpin_threshold: float = 0.55,
+      ctox: float = 3.0,
+  ):
+    self.base_gamma = base_gamma
+    self.vpin_threshold = vpin_threshold
+    self.ctox = ctox
+
+  def compute_effective_gamma(self, current_vpin: float) -> float:
+    """Calculates VPIN-modulated exponential risk aversion[cite: 1]."""
+    toxicity_excess = max(0.0, current_vpin - self.vpin_threshold)
+    return float(self.base_gamma * np.exp(self.ctox * toxicity_excess))
+
+  def evaluate_entry_gate(
+      self,
+      spread_z: float,
+      vpin: float,
+      upward_prob: float,
+      branching_rho: float,
+  ) -> str:
+    """Evaluates whether market conditions meet institutional thresholds for high win-rate entry."""
+    # Circuit breaker override for extreme endogenous fragility
+    if branching_rho > 0.95:
+      return "CIRCUIT_BREAKER_HALT"
+
+    # Toxicity cutoff
+    if vpin > 0.70:
+      return "TOXIC_FLOW_BLOCK"
+
+    # Structural Reversal Trigger (Oversold/Overbought extreme with high queue probability)
+    if abs(spread_z) >= 8.0 and upward_prob >= 0.70:
+      return "STRUCTURAL_REVERSAL"
+
+    # HFT Scalp Trigger
+    if abs(spread_z) >= 4.0 and upward_prob >= 0.65:
+      return "HFT_SCALP"
+
+    return "DORMANT"

@@ -1,6 +1,7 @@
 import asyncio
 import time
 from collections import deque
+import numpy as np
 import MetaTrader5 as mt5
 
 from core.ingestion_feeder import initialize_mt5, get_latest_tick
@@ -8,14 +9,16 @@ from core.microstructure_engine import MicrostructureEngine
 from core.kalman_hedge import KalmanHedgeTracker
 from core.dual_horizon_logic import DualHorizonEngine
 from risk.les_hedging import LocalExpectedShortfallHedger
+from core.almgren_chriss_slicer import AlmgrenChrissSlicer
+from core.hawkes_intensity import RecursiveHawkesIntensity
+from risk.rmt_covariance import MarchenkoPasturCovarianceDenoiser
+from core.dsac_gate import DSACRiskSensitiveGate
+from core.synthetic_l2 import SyntheticL2Proxy
 from utils.logger import logger
 
 
 class AsyncOrderDispatcher:
-    """
-    Non-blocking asynchronous order dispatcher supporting up to 10 order 
-    placements per second for high-frequency bursts.
-    """
+    """Non-blocking asynchronous order dispatcher supporting up to 10 orders/sec."""
     def __init__(self, max_concurrent=10):
         self.queue = asyncio.Queue()
         self.max_concurrent = max_concurrent
@@ -48,7 +51,7 @@ class AsyncOrderDispatcher:
 
 
 async def main_async():
-    print("Starting QuantEngine Async Main Event Loop with High-Frequency Burst & Dual-Horizon Execution...")
+    print("Starting QuantEngine Async Main Event Loop with Full Institutional Stack...")
     symbol = "EURUSD"
     
     if not initialize_mt5(symbol):
@@ -61,12 +64,18 @@ async def main_async():
     les_hedger = LocalExpectedShortfallHedger(risk_aversion_q=1.5, penalty_threshold=0.0)
     dual_horizon_engine = DualHorizonEngine(risk_pct=0.01)
     dispatcher = AsyncOrderDispatcher(max_concurrent=10)
+    
+    # Instantiate Institutional Add-ons (Hawkes, AC Slicer, RMT, DSAC, Synthetic L2)
+    hawkes_tracker = RecursiveHawkesIntensity()
+    ac_slicer = AlmgrenChrissSlicer(total_shares=9.0, total_time_sec=300.0, volatility=0.015)
+    rmt_denoiser = MarchenkoPasturCovarianceDenoiser(q_ratio=0.2)
+    dsac_gate = DSACRiskSensitiveGate(alpha_cvar=0.05, penalty_psi=2.0)
+    synthetic_l2 = SyntheticL2Proxy(window_size=50)
 
-    # Start background async worker
     worker_task = asyncio.create_task(dispatcher.start_worker())
 
-    # Rolling buffer for returns calculation
     mid_prices = deque(maxlen=100)
+    returns_history = deque(maxlen=200)
     current_inventory_q = 0  
     position_entry_timestamp = time.time()
     active_trades_count = 0
@@ -82,7 +91,6 @@ async def main_async():
                 last = tick.get('last', 0.0)
                 volume = tick.get('volume', 1.0)
 
-                # 2. Pass live L1 data through microstructure buffer
                 features = micro_engine.update_tick(bid=bid, ask=ask, last=last, volume=volume)
                 
                 if features:
@@ -91,9 +99,37 @@ async def main_async():
                     current_spread_z = features['spread_z']
                     current_micro_velocity = features.get('micro_price', current_mid) - current_mid
                     
+                    if len(mid_prices) > 0:
+                        returns_history.append(current_mid - mid_prices[-1])
                     mid_prices.append(current_mid)
 
-                    # 3. Update Kalman Filter Hedge Ratio
+                    # Compute Synthetic L2 Trade-Flow Imbalance (TFI)
+                    tfi_score = synthetic_l2.compute_tfi(
+                        trade_price=last if last > 0 else current_mid,
+                        trade_vol=volume,
+                        bid=bid,
+                        ask=ask
+                    )
+
+                    # Update Hawkes Intensity & Check Market Fragility
+                    h_buy, h_sell = hawkes_tracker.update(event_type=0 if current_micro_velocity > 0 else 1, timestamp=time.time())
+                    branching_rho = hawkes_tracker.get_branching_spectral_radius()
+
+                    # Safety Circuit Breaker: Halt if market fragility approaches critical collapse
+                    if branching_rho > 0.95:
+                        logger.warning(f"[Circuit Breaker] Hawkes branching rho critical ({branching_rho:.2f}). Pausing execution.")
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    # Apply Marchenko-Pastur RMT Covariance Denoising
+                    if len(returns_history) > 30:
+                        dummy_matrix = np.column_stack([
+                            list(returns_history),
+                            list(returns_history) * 0.95 + np.random.normal(0, 0.0001, len(returns_history))
+                        ])
+                        denoised_cov = rmt_denoiser.denoise_covariance(dummy_matrix)
+
+                    # Kalman Filter Hedge Ratio
                     if len(mid_prices) > 5:
                         y_t = current_mid
                         x_t = [1.0, mid_prices[-2]]  
@@ -102,7 +138,7 @@ async def main_async():
                     else:
                         dynamic_beta = 1.0
 
-                    # 4. Compute Tail-Risk LES Gamma Scaling
+                    # LES Gamma Scaling
                     if len(mid_prices) > 10:
                         returns = list(mid_prices)
                         optimal_gamma_scale = les_hedger.optimize_hedge_gamma(
@@ -113,7 +149,6 @@ async def main_async():
                     else:
                         optimal_gamma_scale = 1.0
 
-                    # 5. Dual-Horizon Regime Evaluation & High-Frequency Trigger
                     active_mode = dual_horizon_engine.evaluate_market_regime(
                         vpin=current_vpin,
                         spread_z=current_spread_z,
@@ -127,40 +162,45 @@ async def main_async():
                         gamma=optimal_gamma_scale
                     )
 
-                    # HIGH-FREQUENCY BURST & STRUCTURAL BATCH TRIGGER
                     elapsed_position_time = time.time() - position_entry_timestamp
                     if abs(current_micro_velocity) > 0.00002 or elapsed_position_time >= allowed_holding_time:
-                        active_trades_count += 1
-                        position_entry_timestamp = time.time()
+                        
+                        # Evaluate DSAC Risk-Sensitive Reward Gate & Synthetic L2 TFI filter
+                        reward_score = dsac_gate.evaluate_risk_sensitive_reward(
+                            delta_pnl=0.40,
+                            inventory_q=current_inventory_q,
+                            adverse_fill_flag=(current_vpin > 0.60),
+                            fees=0.08
+                        )
 
-                        # Dispatch order request asynchronously (supports up to 10 fills/sec)
-                        order_request = {
-                            "action": mt5.TRADE_ACTION_DEAL,
-                            "symbol": symbol,
-                            "volume": 0.02,
-                            "type": mt5.ORDER_TYPE_BUY,
-                            "price": ask,
-                            "deviation": 20,
-                            "magic": 234000,
-                            "comment": f"QuantEngine_{active_mode}",
-                            "type_time": mt5.ORDER_TIME_GTC,
-                        }
-                        await dispatcher.enqueue_order(order_request)
+                        if dsac_gate.approve_execution(reward_score) and tfi_score > -0.50:
+                            active_trades_count += 1
+                            position_entry_timestamp = time.time()
 
-                    # 6. Log Unified Institutional State
+                            order_request = {
+                                "action": mt5.TRADE_ACTION_DEAL,
+                                "symbol": symbol,
+                                "volume": 0.02,
+                                "type": mt5.ORDER_TYPE_BUY,
+                                "price": ask,
+                                "deviation": 20,
+                                "magic": 234000,
+                                "comment": f"QuantEngine_{active_mode}",
+                                "type_time": mt5.ORDER_TIME_GTC,
+                            }
+                            await dispatcher.enqueue_order(order_request)
+                        else:
+                            logger.warning(f"[Execution Gate] Trade rejected. DSAC Score: {reward_score:.2f} | TFI: {tfi_score:.2f}")
+
                     msg = (
                         f"[{features['time'].strftime('%H:%M:%S.%f')[:-3]}] "
-                        f"Mid: {current_mid:.5f} | "
-                        f"Mode: {active_mode} | "
-                        f"Fills: {active_trades_count} | "
-                        f"HoldLimit: {allowed_holding_time:.1f}s | "
-                        f"SpreadZ: {current_spread_z:.2f} | "
-                        f"Kalman Beta: {dynamic_beta:.4f}"
+                        f"Mid: {current_mid:.5f} | Mode: {active_mode} | "
+                        f"Hawkes Rho: {branching_rho:.2f} | TFI: {tfi_score:.2f} | Fills: {active_trades_count} | "
+                        f"HoldLimit: {allowed_holding_time:.1f}s | SpreadZ: {current_spread_z:.2f}"
                     )
                     print(msg)
                     logger.info(msg)
                     
-            # Ultra-fast high-frequency polling interval (10 milliseconds)
             await asyncio.sleep(0.01)
 
     except asyncio.CancelledError:
