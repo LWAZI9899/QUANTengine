@@ -1,3 +1,9 @@
-def compute_reservation_price(mid, inventory, risk_aversion=0.1, volatility=0.015, time_horizon=1.0):
-    """Computes Avellaneda-Stoikov HJB reservation price adjusting for inventory skew."""
-    return mid - (inventory * risk_aversion * (volatility ** 2) * time_horizon)
+import numpy as np
+
+def calculate_reservation_price(mid_price: float, inventory_q: int, gamma: float, volatility: float, time_to_close: float) -> float:
+    """
+    Calculates the Avellaneda-Stoikov reservation price R(s, q, t).
+    """
+    variance_term = (volatility ** 2) * time_to_close
+    reservation_price = mid_price - (inventory_q * gamma * variance_term)
+    return float(reservation_price)
