@@ -15,6 +15,9 @@ from risk.rmt_covariance import MarchenkoPasturCovarianceDenoiser
 from core.dsac_gate import DSACRiskSensitiveGate
 from core.synthetic_l2 import SyntheticL2Proxy
 from risk.circuit_breakers import get_session_volatility_weight
+
+# Import the Cont-de Larrard Queue Depletion Simulation Gate
+from sims.sim_monte_carlo_queue import simulate_queue_depletion
 from utils.logger import logger
 
 
@@ -52,7 +55,7 @@ class AsyncOrderDispatcher:
 
 
 async def main_async():
-    print("Starting QuantEngine Async Main Event Loop (24/7 All-Day Mode Enabled)...")
+    print("Starting QuantEngine Async Main Event Loop (24/7 Mode + Live MCQ Gate Enabled)...")
     symbol = "EURUSD"
     
     if not initialize_mt5(symbol):
@@ -81,7 +84,7 @@ async def main_async():
     position_entry_timestamp = time.time()
     active_trades_count = 0
 
-    print(f"Streaming high-frequency L1 order flow ticks for {symbol} 24/7...")
+    print(f"Streaming high-frequency L1 order flow ticks for {symbol} 24/7 with live queue simulation gates...")
 
     try:
         while True:
@@ -103,7 +106,7 @@ async def main_async():
                 
                 if features:
                     current_mid = features['mid']
-                    current_vpin = features.get('vpin', 0.32) * vol_weight  # Scaled by session volatility
+                    current_vpin = features.get('vpin', 0.32) * vol_weight
                     current_spread_z = features['spread_z']
                     current_micro_velocity = features.get('micro_price', current_mid) - current_mid
                     
@@ -169,10 +172,16 @@ async def main_async():
                         gamma=optimal_gamma_scale
                     )
 
+                    # LIVE MONTE CARLO QUEUE RACE EVALUATION (Cont-de Larrard Gate)
+                    # Extract top-of-book volumes or proxy them from tick volume
+                    vb_proxy = volume * 1500.0 if volume > 0 else 3000.0
+                    va_proxy = volume * 1200.0 if volume > 0 else 3000.0
+                    fill_probability = simulate_queue_depletion(vb=vb_proxy, va=va_proxy, rho_ab=0.15, num_paths=1000)
+
                     elapsed_position_time = time.time() - position_entry_timestamp
                     if abs(current_micro_velocity) > 0.00002 or elapsed_position_time >= allowed_holding_time:
                         
-                        # Evaluate DSAC Risk-Sensitive Reward Gate & Synthetic L2 TFI filter
+                        # Evaluate DSAC Risk-Sensitive Reward Gate, TFI filter, and LIVE MCQ Fill Probability Gate (> 70%)
                         reward_score = dsac_gate.evaluate_risk_sensitive_reward(
                             delta_pnl=0.40,
                             inventory_q=current_inventory_q,
@@ -180,7 +189,7 @@ async def main_async():
                             fees=0.08
                         )
 
-                        if dsac_gate.approve_execution(reward_score) and tfi_score > -0.50:
+                        if dsac_gate.approve_execution(reward_score) and tfi_score > -0.50 and fill_probability >= 0.70:
                             active_trades_count += 1
                             position_entry_timestamp = time.time()
 
@@ -197,13 +206,16 @@ async def main_async():
                             }
                             await dispatcher.enqueue_order(order_request)
                         else:
-                            logger.warning(f"[Execution Gate] Trade rejected. DSAC Score: {reward_score:.2f} | TFI: {tfi_score:.2f}")
+                            logger.warning(
+                                f"[Execution Gate] Trade rejected. DSAC Score: {reward_score:.2f} | "
+                                f"TFI: {tfi_score:.2f} | MCQ P(Fill): {fill_probability*100:.1f}%"
+                            )
 
                     msg = (
                         f"[{features['time'].strftime('%H:%M:%S.%f')[:-3]}] "
                         f"VolWeight: {vol_weight}x | Mode: {active_mode} | "
-                        f"Hawkes Rho: {branching_rho:.2f} | TFI: {tfi_score:.2f} | Fills: {active_trades_count} | "
-                        f"HoldLimit: {allowed_holding_time:.1f}s"
+                        f"Hawkes Rho: {branching_rho:.2f} | MCQ P(Fill): {fill_probability*100:.1f}% | "
+                        f"Fills: {active_trades_count} | HoldLimit: {allowed_holding_time:.1f}s"
                     )
                     print(msg)
                     logger.info(msg)
