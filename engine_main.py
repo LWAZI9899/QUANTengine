@@ -14,6 +14,7 @@ from core.hawkes_intensity import RecursiveHawkesIntensity
 from risk.rmt_covariance import MarchenkoPasturCovarianceDenoiser
 from core.dsac_gate import DSACRiskSensitiveGate
 from core.synthetic_l2 import SyntheticL2Proxy
+from risk.circuit_breakers import get_session_volatility_weight
 from utils.logger import logger
 
 
@@ -51,7 +52,7 @@ class AsyncOrderDispatcher:
 
 
 async def main_async():
-    print("Starting QuantEngine Async Main Event Loop with Full Institutional Stack...")
+    print("Starting QuantEngine Async Main Event Loop (24/7 All-Day Mode Enabled)...")
     symbol = "EURUSD"
     
     if not initialize_mt5(symbol):
@@ -65,7 +66,7 @@ async def main_async():
     dual_horizon_engine = DualHorizonEngine(risk_pct=0.01)
     dispatcher = AsyncOrderDispatcher(max_concurrent=10)
     
-    # Instantiate Institutional Add-ons (Hawkes, AC Slicer, RMT, DSAC, Synthetic L2)
+    # Instantiate Institutional Add-ons
     hawkes_tracker = RecursiveHawkesIntensity()
     ac_slicer = AlmgrenChrissSlicer(total_shares=9.0, total_time_sec=300.0, volatility=0.015)
     rmt_denoiser = MarchenkoPasturCovarianceDenoiser(q_ratio=0.2)
@@ -80,10 +81,17 @@ async def main_async():
     position_entry_timestamp = time.time()
     active_trades_count = 0
 
-    print(f"Streaming high-frequency L1 order flow ticks for {symbol}...")
+    print(f"Streaming high-frequency L1 order flow ticks for {symbol} 24/7...")
 
     try:
         while True:
+            # Check 24/7 session status (only pauses on weekends)
+            is_active, vol_weight = get_session_volatility_weight()
+            if not is_active:
+                logger.info("[Weekend Guardrail] Forex markets closed. Engine resting until Monday open.")
+                await asyncio.sleep(60.0)
+                continue
+
             tick = get_latest_tick(symbol)
             if tick:
                 bid = tick['bid']
@@ -95,7 +103,7 @@ async def main_async():
                 
                 if features:
                     current_mid = features['mid']
-                    current_vpin = features.get('vpin', 0.32)
+                    current_vpin = features.get('vpin', 0.32) * vol_weight  # Scaled by session volatility
                     current_spread_z = features['spread_z']
                     current_micro_velocity = features.get('micro_price', current_mid) - current_mid
                     
@@ -115,7 +123,6 @@ async def main_async():
                     h_buy, h_sell = hawkes_tracker.update(event_type=0 if current_micro_velocity > 0 else 1, timestamp=time.time())
                     branching_rho = hawkes_tracker.get_branching_spectral_radius()
 
-                    # Safety Circuit Breaker: Halt if market fragility approaches critical collapse
                     if branching_rho > 0.95:
                         logger.warning(f"[Circuit Breaker] Hawkes branching rho critical ({branching_rho:.2f}). Pausing execution.")
                         await asyncio.sleep(1.0)
@@ -185,7 +192,7 @@ async def main_async():
                                 "price": ask,
                                 "deviation": 20,
                                 "magic": 234000,
-                                "comment": f"QuantEngine_{active_mode}",
+                                "comment": f"247_Engine_{active_mode}",
                                 "type_time": mt5.ORDER_TIME_GTC,
                             }
                             await dispatcher.enqueue_order(order_request)
@@ -194,9 +201,9 @@ async def main_async():
 
                     msg = (
                         f"[{features['time'].strftime('%H:%M:%S.%f')[:-3]}] "
-                        f"Mid: {current_mid:.5f} | Mode: {active_mode} | "
+                        f"VolWeight: {vol_weight}x | Mode: {active_mode} | "
                         f"Hawkes Rho: {branching_rho:.2f} | TFI: {tfi_score:.2f} | Fills: {active_trades_count} | "
-                        f"HoldLimit: {allowed_holding_time:.1f}s | SpreadZ: {current_spread_z:.2f}"
+                        f"HoldLimit: {allowed_holding_time:.1f}s"
                     )
                     print(msg)
                     logger.info(msg)
