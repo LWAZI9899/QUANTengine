@@ -1,0 +1,7 @@
+# Global Settings and Configuration Constants
+SYMBOL = "EURUSD"
+TIMEFRAME = "TICK"
+MAX_INVENTORY = 1.0
+LOT_SIZE = 0.01
+SPREAD_WINDOW = 500
+VPIN_BUCKET_SIZE = 200
